@@ -1,0 +1,147 @@
+# =============================================================================
+# Dockerfile.buildpy_openfpga
+#
+# Lean FPGA design image — two repos, minimal overlap:
+#
+#   PRGA repo   : Python package only (for build.py → vpr/arch.xml)
+#                 PRGA's own VTR / Yosys / ABC are NOT built —
+#                 OpenFPGA supplies its own VPR and Yosys.
+#
+#   OpenFPGA repo : full build (VPR + Yosys + openfpga shell)
+#
+# Pipeline inside this image:
+#   1. build.py               → vpr/arch.xml   (PRGA Python API)
+#   2. patch_vpr_arch.py      → vpr/arch.xml   (adds physical io mode)
+#   3. generate_openfpga_arch.py → openfpga_arch.xml  (pure stdlib)
+#   4. Yosys (OpenFPGA)       → syn/result.blif
+#   5. openfpga shell         → VPR P&R → bitstream → fabric RTL
+#
+# Compared to Dockerfile.prga_openfpga:
+#   - Skips PRGA's envscr/install  (saves ~2 GB, ~20 min build time)
+#   - No PRGA VTR / ABC / Yosys binaries
+#   - arch.xml is the only artefact that crosses PRGA → OpenFPGA
+# =============================================================================
+FROM ubuntu:20.04
+
+LABEL description="build.py + OpenFPGA FPGA design image (Ubuntu 20.04)"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# =============================================================================
+# System dependencies (shared by PRGA Python package and OpenFPGA C++ build)
+# =============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc g++ \
+    git curl wget ca-certificates \
+    make cmake \
+    python3.8 python3.8-dev python3-pip \
+    libreadline-dev libffi-dev \
+    libboost-all-dev flex bison \
+    libeigen3-dev libgraphviz-dev graphviz \
+    libncurses5-dev zlib1g-dev pkg-config \
+    libssl-dev libbz2-dev libsqlite3-dev liblzma-dev tk-dev \
+    tcl-dev uuid-dev \
+    libcairo2-dev libgtk-3-dev libfontconfig1-dev \
+    swig \
+    software-properties-common \
+    ccache \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.8 -m pip install --upgrade pip==21.3.1 setuptools wheel
+
+# =============================================================================
+# CMake >= 3.19 — Ubuntu 20.04 ships 3.16, too old for OpenFPGA's
+# libs/libini INTERFACE_LIBRARY PREFIX property check.
+# =============================================================================
+RUN wget -qO - https://apt.kitware.com/keys/kitware-archive-latest.asc | \
+    gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg && \
+    echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ focal main' \
+        > /etc/apt/sources.list.d/kitware.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends cmake && \
+    rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# GCC 11 — OpenFPGA's C++ code requires <barrier> (C++20 concurrency header)
+# which is absent in GCC 10. Ubuntu 20.04 toolchain PPA provides GCC 11.
+# =============================================================================
+RUN add-apt-repository ppa:ubuntu-toolchain-r/test -y && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    gcc-11 g++-11 \
+    && rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# PRGA — Python package only (no VTR / Yosys / ABC build)
+#
+# We need the Python package so that build.py can import the PRGA
+# fabric-definition API and generate vpr/arch.xml.
+# The PRGA repo is kept at /opt/prga so it is available for reference
+# or future use, but ./envscr/install is intentionally NOT run.
+# =============================================================================
+WORKDIR /opt
+RUN git clone https://github.com/PrincetonUniversity/prga.git
+
+WORKDIR /opt/prga
+# Only the prga.py submodule is needed (holds setup.py + Python sources).
+# Skip deep recursive init to avoid cloning the heavy VTR sub-submodule.
+RUN git submodule update --init prga.py
+
+WORKDIR /opt/prga/prga.py
+RUN python3.8 -m pip install -e .
+
+ENV PYTHONPATH="/opt/prga/prga.py:${PYTHONPATH}"
+
+# =============================================================================
+# OpenFPGA — full build (VPR + Yosys + openfpga shell)
+#
+# This is the primary toolchain.  It provides:
+#   - its own VPR     (place & route)
+#   - its own Yosys   (synthesis with synth_openfpga pass)
+#   - openfpga shell  (link / build_fabric / bitstream / write_verilog)
+# =============================================================================
+WORKDIR /opt
+RUN git clone https://github.com/Vjshan7/OpenFPGA.git \
+        --depth 1 --branch prga-compat
+
+WORKDIR /opt/OpenFPGA
+RUN git submodule update --init --recursive
+
+# arch_util.cpp C++20 fix: (stringstream() << x).str() is invalid in C++20.
+# Patch here because the fix is in the vtr-verilog-to-routing submodule
+# (a separate repo) which would need its own fork to fix cleanly.
+RUN python3.8 <<'PYEOF'
+path = "vtr-verilog-to-routing/libs/libarchfpga/src/arch_util.cpp"
+with open(path) as f:
+    lines = f.readlines()
+out = []
+for line in lines:
+    if 'std::stringstream()' in line and 'Memory pb_type' in line and '.str()' in line:
+        indent = len(line) - len(line.lstrip())
+        out.append(' ' * indent +
+            'std::ostringstream _oss; _oss << "Memory pb_type " '
+            '<< mem_pb_type->name << " has no interconnect"; '
+            'std::string error_msg = _oss.str();\n')
+        print("Patched arch_util.cpp")
+    else:
+        out.append(line)
+with open(path, 'w') as f:
+    f.writelines(out)
+PYEOF
+
+RUN cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=gcc-11 \
+          -DCMAKE_CXX_COMPILER=g++-11 \
+    && cmake --build build --parallel $(nproc) --target openfpga \
+    && cmake --build build --parallel $(nproc) --target yosys
+
+ENV PATH="/opt/OpenFPGA/build/openfpga:${PATH}"
+ENV PATH="/opt/OpenFPGA/build/vtr-verilog-to-routing/vpr:${PATH}"
+ENV PATH="/opt/OpenFPGA/build/yosys:${PATH}"
+ENV OPENFPGA_PATH="/opt/OpenFPGA"
+
+# =============================================================================
+# Workspace
+# =============================================================================
+WORKDIR /workspace
+CMD ["/bin/bash"]

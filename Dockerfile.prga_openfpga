@@ -1,0 +1,125 @@
+FROM ubuntu:20.04
+
+LABEL description="PRGA + OpenFPGA unified FPGA design environment (Ubuntu 20.04)"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ================================================================
+# System deps shared by PRGA and OpenFPGA
+# Ubuntu 20.04: Python 3.8 native, GCC 9 native, cmake 3.16 native
+# ================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc g++ \
+    git curl wget ca-certificates \
+    make cmake \
+    python3.8 python3.8-dev python3-pip \
+    libreadline-dev libffi-dev \
+    libboost-all-dev flex bison \
+    libeigen3-dev libgraphviz-dev graphviz \
+    libncurses5-dev zlib1g-dev pkg-config \
+    libssl-dev libbz2-dev libsqlite3-dev liblzma-dev tk-dev \
+    tcl-dev uuid-dev \
+    libcairo2-dev libgtk-3-dev libfontconfig1-dev \
+    swig \
+    software-properties-common \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.8 -m pip install --upgrade pip==21.3.1 setuptools wheel
+
+# ================================================================
+# PRGA — clone, install Python package, build VTR/Yosys/ABC
+# ================================================================
+WORKDIR /opt
+RUN git clone https://github.com/PrincetonUniversity/prga.git
+WORKDIR /opt/prga
+RUN git submodule update --init --recursive
+
+# Install from the real prga.py submodule (has correct setup.py + deps)
+WORKDIR /opt/prga/prga.py
+RUN python3.8 -m pip install -e .
+
+# Build VTR / Yosys / ABC via PRGA's own installer
+WORKDIR /opt/prga
+RUN chmod +x envscr/install && ./envscr/install
+
+# Link ABC if built inside VTR
+RUN if [ -f /opt/prga/vtr/build/abc/abc ]; then \
+        ln -sf /opt/prga/vtr/build/abc/abc /usr/local/bin/abc; \
+    fi
+
+ENV PATH="/opt/prga/local/bin:${PATH}"
+ENV PYTHONPATH="/opt/prga/prga.py:${PYTHONPATH}"
+
+# ================================================================
+# Upgrade CMake to >= 3.19 (Ubuntu 20.04 ships 3.16 which is too old
+# for OpenFPGA's libs/libini INTERFACE_LIBRARY PREFIX property)
+# ================================================================
+RUN wget -qO - https://apt.kitware.com/keys/kitware-archive-latest.asc | \
+    gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg && \
+    echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ focal main' \
+        > /etc/apt/sources.list.d/kitware.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends cmake && \
+    rm -rf /var/lib/apt/lists/*
+
+# ================================================================
+# Install GCC 11 — OpenFPGA's latest code requires full C++20
+# including <barrier> (C++20 concurrency header not in GCC 10).
+# GCC 11 is available on Ubuntu 20.04 via the toolchain PPA.
+# Use it only for OpenFPGA; PRGA tools are already built above.
+# ================================================================
+RUN add-apt-repository ppa:ubuntu-toolchain-r/test -y && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    gcc-11 g++-11 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ================================================================
+# OpenFPGA — clone from vjshan07's fork (pinned to prga-compat tag)
+# Fork: https://github.com/Vjshan7/OpenFPGA
+# Contains: arch_util.cpp C++20 fix applied as a clean commit
+# ================================================================
+WORKDIR /opt
+RUN git clone https://github.com/Vjshan7/OpenFPGA.git \
+        --depth 1 --branch prga-compat
+WORKDIR /opt/OpenFPGA
+RUN git submodule update --init --recursive
+
+# arch_util.cpp C++20 fix: patch here since the fix is in the
+# vtr-verilog-to-routing submodule (separate repo, separate fork needed).
+RUN python3.8 <<'PYEOF'
+path = "vtr-verilog-to-routing/libs/libarchfpga/src/arch_util.cpp"
+with open(path) as f:
+    lines = f.readlines()
+out = []
+for line in lines:
+    if 'std::stringstream()' in line and 'Memory pb_type' in line and '.str()' in line:
+        indent = len(line) - len(line.lstrip())
+        out.append(' ' * indent +
+            'std::ostringstream _oss; _oss << "Memory pb_type " '
+            '<< mem_pb_type->name << " has no interconnect"; '
+            'std::string error_msg = _oss.str();\n')
+        print("Patched arch_util.cpp")
+    else:
+        out.append(line)
+with open(path, 'w') as f:
+    f.writelines(out)
+PYEOF
+
+# Build OpenFPGA with GCC 11 (C++20 support) + its own Yosys.
+# Do NOT pass -DWITH_YOSYS=OFF: OpenFPGA needs its own Yosys build
+# which includes the custom 'synth_openfpga' pass not in PRGA's Yosys 0.9.
+RUN cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=gcc-11 \
+          -DCMAKE_CXX_COMPILER=g++-11 \
+    && cmake --build build --parallel $(nproc) --target openfpga
+
+ENV PATH="/opt/OpenFPGA/build/openfpga:${PATH}"
+ENV PATH="/opt/OpenFPGA/build/vpr:${PATH}"
+ENV OPENFPGA_PATH="/opt/OpenFPGA"
+
+# ================================================================
+# Final workspace
+# ================================================================
+WORKDIR /workspace
+CMD ["/bin/bash"]

@@ -1,0 +1,52 @@
+# OpenFPGA shell script for the 2x2 K4/N1 FPGA + adder application.
+# This is a REFERENCE template — run_openfpga.py generates a copy with
+# correct absolute paths at runtime (openfpga_flow_generated.openfpga).
+# Command order matches OpenFPGA v1.2: VPR runs before read_openfpga_arch.
+#
+# Usage:  openfpga -batch -f openfpga_flow_generated.openfpga
+
+# ── 1. VPR place & route (must run first so arch is in memory) ───────────────
+vpr /opt/examples/fpga_k4_N1_2x2/vpr/arch.xml \
+    /opt/examples/fpga_k4_N1_2x2/syn/result.blif \
+    --clock_modeling route \
+    --route_chan_width 100 \
+    --allow_unrelated_clustering on \
+    --seed 1 \
+    --net_file   /opt/examples/fpga_k4_N1_2x2/openfpga_out/result.net \
+    --place_file /opt/examples/fpga_k4_N1_2x2/openfpga_out/result.place \
+    --route_file /opt/examples/fpga_k4_N1_2x2/openfpga_out/result.route
+
+# ── 2. Read OpenFPGA circuit-level arch ──────────────────────────────────────
+read_openfpga_arch --file /opt/examples/fpga_k4_N1_2x2/openfpga_arch.xml
+
+# ── 3. Link circuit models to routed netlist ──────────────────────────────────
+link_openfpga_arch --sort_gsb_chan_node_in_edges
+
+# ── 4. Fix naming conflicts ───────────────────────────────────────────────────
+check_netlist_naming_conflict --fix \
+    --output /opt/examples/fpga_k4_N1_2x2/openfpga_out/result_fixed.blif
+
+# ── 5. Fix up LUT truth tables ────────────────────────────────────────────────
+lut_truth_table_fixup
+
+# ── 6. Build programmable fabric ─────────────────────────────────────────────
+build_fabric --compress_routing
+
+# ── 7. Repack netlist to physical pbs ────────────────────────────────────────
+repack
+
+# ── 8. Build and write bitstream ──────────────────────────────────────────────
+build_architecture_bitstream
+build_fabric_bitstream
+write_fabric_bitstream \
+    --file /opt/examples/fpga_k4_N1_2x2/openfpga_out/fabric_bitstream.xml \
+    --format plain_text \
+    --verbose
+
+# ── 9. Write fabric RTL Verilog ───────────────────────────────────────────────
+write_fabric_verilog \
+    --file /opt/examples/fpga_k4_N1_2x2/openfpga_out/rtl/ \
+    --explicit_port_mapping \
+    --verbose
+
+exit
