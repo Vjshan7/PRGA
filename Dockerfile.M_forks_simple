@@ -1,0 +1,147 @@
+# =============================================================================
+# Dockerfile.M_forks_simple
+#
+# Clean, fork-based image using only pinned forks — no upstream dependency:
+#
+#   Vjshan7/PRGA@prga-compat    — PRGA Python pkg + all integration scripts
+#   Vjshan7/OpenFPGA@prga-compat — OpenFPGA pinned to commit 504ccb7
+#
+# Pipeline:
+#   1. build.py               → vpr/arch.xml      (PRGA Python API)
+#   2. patch_vpr_arch         → vpr/arch.xml      (adds physical io mode)
+#   3. generate_openfpga_arch → openfpga_arch.xml (stdlib bridge)
+#   4. Yosys (OpenFPGA)       → syn/result.blif
+#   5. openfpga shell         → VPR P&R → bitstream → fabric RTL
+#
+# Advantages over Dockerfile.prga_openfpga / Dockerfile.buildpy_openfpga:
+#   - Both repos pinned — fully reproducible builds
+#   - All scripts (examples, run_*.py, analyze_results.py) come from the fork
+#   - No upstream dependency at build time
+#   - PRGA's VTR/Yosys/ABC build skipped (saves ~2 GB, ~20 min)
+# =============================================================================
+FROM ubuntu:20.04
+
+LABEL description="PRGA+OpenFPGA from Vjshan7 forks — fully pinned (Ubuntu 20.04)"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# =============================================================================
+# System dependencies
+# =============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc g++ \
+    git curl wget ca-certificates \
+    make cmake \
+    python3.8 python3.8-dev python3-pip \
+    libreadline-dev libffi-dev \
+    libboost-all-dev flex bison \
+    libeigen3-dev libgraphviz-dev graphviz \
+    libncurses5-dev zlib1g-dev pkg-config \
+    libssl-dev libbz2-dev libsqlite3-dev liblzma-dev tk-dev \
+    tcl-dev uuid-dev \
+    libcairo2-dev libgtk-3-dev libfontconfig1-dev \
+    swig \
+    software-properties-common \
+    ccache \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.8 -m pip install --upgrade pip==21.3.1 setuptools wheel
+
+# =============================================================================
+# CMake >= 3.19  (Ubuntu 20.04 ships 3.16 — too old for OpenFPGA)
+# =============================================================================
+RUN wget -qO - https://apt.kitware.com/keys/kitware-archive-latest.asc | \
+    gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg && \
+    echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ focal main' \
+        > /etc/apt/sources.list.d/kitware.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends cmake && \
+    rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# GCC 11  (OpenFPGA requires <barrier> — C++20 concurrency, absent in GCC 10)
+# =============================================================================
+RUN add-apt-repository ppa:ubuntu-toolchain-r/test -y && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    gcc-11 g++-11 \
+    && rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# PRGA — from Vjshan7/PRGA@prga-compat
+#
+# Contains: build.py, generate_openfpga_arch.py, run_buildpy_openfpga.py,
+#           analyze_results.py, view_results.sh, Dockerfiles, adder example
+#
+# Only the prga.py submodule is initialised — no PRGA VTR/Yosys/ABC build.
+# =============================================================================
+WORKDIR /opt
+RUN git clone https://github.com/Vjshan7/PRGA.git prga \
+        --depth 1 --branch prga-compat
+
+WORKDIR /opt/prga
+RUN git submodule update --init prga.py
+
+WORKDIR /opt/prga/prga.py
+RUN python3.8 -m pip install -e .
+
+ENV PYTHONPATH="/opt/prga/prga.py:${PYTHONPATH}"
+
+# =============================================================================
+# OpenFPGA — from Vjshan7/OpenFPGA@prga-compat  (commit 504ccb7)
+#
+# Provides: VPR (place & route), Yosys (synthesis), openfpga shell
+# =============================================================================
+WORKDIR /opt
+RUN git clone https://github.com/Vjshan7/OpenFPGA.git \
+        --depth 1 --branch prga-compat
+
+WORKDIR /opt/OpenFPGA
+RUN git submodule update --init --recursive
+
+# arch_util.cpp C++20 fix: (stringstream() << x).str() is invalid in C++20.
+# Lives in the vtr-verilog-to-routing submodule — patched here until a
+# Vjshan7/vtr-verilog-to-routing fork is created.
+RUN python3.8 <<'PYEOF'
+path = "vtr-verilog-to-routing/libs/libarchfpga/src/arch_util.cpp"
+with open(path) as f:
+    lines = f.readlines()
+out = []
+for line in lines:
+    if 'std::stringstream()' in line and 'Memory pb_type' in line and '.str()' in line:
+        indent = len(line) - len(line.lstrip())
+        out.append(' ' * indent +
+            'std::ostringstream _oss; _oss << "Memory pb_type " '
+            '<< mem_pb_type->name << " has no interconnect"; '
+            'std::string error_msg = _oss.str();\n')
+        print("Patched arch_util.cpp OK")
+    else:
+        out.append(line)
+with open(path, 'w') as f:
+    f.writelines(out)
+PYEOF
+
+# Bison 3.8.2 — Ubuntu 20.04 ships 3.5.1 but OpenFPGA's Yosys needs >= 3.6
+RUN wget -q https://ftp.gnu.org/gnu/bison/bison-3.8.2.tar.gz && \
+    tar xf bison-3.8.2.tar.gz && \
+    cd bison-3.8.2 && ./configure --prefix=/usr/local && \
+    make -j$(nproc) && make install && \
+    cd /opt/OpenFPGA && rm -rf bison-3.8.2*
+
+RUN cmake -S . -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=gcc-11 \
+          -DCMAKE_CXX_COMPILER=g++-11 \
+    && cmake --build build --parallel $(nproc) --target openfpga \
+    && cmake --build build --parallel $(nproc) --target yosys
+
+ENV PATH="/opt/OpenFPGA/build/openfpga:${PATH}"
+ENV PATH="/opt/OpenFPGA/build/vtr-verilog-to-routing/vpr:${PATH}"
+ENV PATH="/opt/OpenFPGA/build/yosys:${PATH}"
+ENV OPENFPGA_PATH="/opt/OpenFPGA"
+
+# =============================================================================
+# Mount point for examples (host volume or pre-baked from fork)
+# The fork's examples live at /opt/prga/examples/fpga_k4_N1_2x2
+# =============================================================================
+WORKDIR /workspace
+CMD ["/bin/bash"]
