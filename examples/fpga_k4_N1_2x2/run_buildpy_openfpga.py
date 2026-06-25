@@ -40,7 +40,7 @@ OUT_DIR      = os.path.join(FABRIC_DIR, 'openfpga_out')
 
 OPENFPGA_BIN = '/opt/OpenFPGA/build/openfpga/openfpga'
 VPR_BIN      = '/opt/OpenFPGA/build/vtr-verilog-to-routing/vpr/vpr'
-YOSYS_BIN    = '/opt/OpenFPGA/build/yosys/bin/yosys'
+YOSYS_BIN    = 'yosys'
 OPENFPGA_PATH= '/opt/OpenFPGA'
 
 # ---------------------------------------------------------------------------
