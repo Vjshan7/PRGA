@@ -181,7 +181,7 @@ def step_openfpga_flow():
             --net_file {OUT_DIR}/result.net \\
             --place_file {OUT_DIR}/result.place \\
             --route_file {OUT_DIR}/result.route \\
-            --full_stats --nodisp \\
+            --full_stats on --disp off \\
             --route_chan_width 40 \\
             --clock_modeling route
 
@@ -223,8 +223,7 @@ def step_openfpga_flow():
     env = os.environ.copy()
     env['OPENFPGA_PATH'] = OPENFPGA_PATH
 
-    run([OPENFPGA_BIN, '--batch_mode',
-         '--interactive_command_file', flow_file],
+    run([OPENFPGA_BIN, '--file', flow_file],
         cwd=OUT_DIR, env=env)
 
     log.info('OK  OpenFPGA flow complete')
